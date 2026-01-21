@@ -12,6 +12,17 @@ import random
 import hashlib
 
 from pathlib import Path
+from flask import Flask, request
+
+app = Flask(_name_)
+
+@app.route("/", methods=["GET"])
+def home():
+    return "OK"
+
+@app.route("/callback", methods=["POST"])
+def callback():
+    return "OK"
 
 # =========================
 # 專案資料夾位置（一定要有）
@@ -418,4 +429,5 @@ print("user_text =",handle_user_text)
 # run
 # =========================
 if __name__ == "__main__":
+
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
