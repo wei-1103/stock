@@ -5,14 +5,64 @@ import os
 import sqlite3
 from pathlib import Path
 from datetime import datetime
-from typing import List, Optional, Tuple, Dict
+from typing import List, Dict
 
-DB_PATH = os.environ.get("DB_PATH", "/var/data/bot.db")
-Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+# =========================
+# Path resolution (safe)
+# =========================
+def _is_writable_dir(dir_path: Path) -> bool:
+    """
+    檢查目錄是否可寫：
+    - 目錄不存在：嘗試建立
+    - 可建立 / 可寫入測試檔 => True
+    """
+    try:
+        dir_path.mkdir(parents=True, exist_ok=True)
+        test_file = dir_path / ".write_test"
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write("ok")
+        try:
+            test_file.unlink()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_db_path() -> str:
+    """
+    依序嘗試：
+    1) env DB_PATH（你設定的）
+    2) /var/data/bot.db（你原本的預設）
+    3) /tmp/data/bot.db（Render 免費方案保底可寫）
+    """
+    candidates = [
+        os.environ.get("DB_PATH", "").strip(),
+        "/var/data/bot.db",
+        "/tmp/data/bot.db",
+    ]
+
+    for p in candidates:
+        if not p:
+            continue
+        path = Path(p)
+        parent = path.parent
+        if _is_writable_dir(parent):
+            return str(path)
+
+    # 最後保底：當前目錄（理論上幾乎不會走到這）
+    local_fallback = Path.cwd() / "bot.db"
+    _is_writable_dir(local_fallback.parent)
+    return str(local_fallback)
+
+
+DB_PATH = _resolve_db_path()
 
 
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    # timeout 避免偶發的 database is locked（多工/cron 同時碰到時）
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
