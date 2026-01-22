@@ -238,6 +238,50 @@ def _fetch_finmind_stock_price(ticker: str) -> pd.DataFrame:
     return df
 
 
+def _fetch_finmind_taiex() -> pd.DataFrame:
+    """
+    用 FinMind 抓加權指數（TAIEX）
+    回傳欄位：Close，index=DatetimeIndex
+    讓你後面 get_series(df,"Close") 不用改
+    """
+    if not FINMIND_TOKEN:
+        return pd.DataFrame()
+
+    start_date = (datetime.now() - pd.Timedelta(days=LOOKBACK_DAYS + 60)).strftime("%Y-%m-%d")
+
+    headers = {"Authorization": f"Bearer {FINMIND_TOKEN}"}
+    params = {
+        "dataset": "TaiwanStockIndex",
+        "data_id": "TAIEX",
+        "start_date": start_date,
+    }
+
+    r = requests.get(FINMIND_API, headers=headers, params=params, timeout=30)
+    r.raise_for_status()
+    js = r.json()
+
+    data = js.get("data") or []
+    if not data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data)
+
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+
+    if "close" in df.columns:
+        df = df.rename(columns={"close": "Close"})
+
+    if "Close" not in df.columns:
+        return pd.DataFrame()
+
+    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+    df = df.dropna(subset=["Close"])
+
+    return df[["Close"]].copy()
+
+
 # =========================
 # 抓價格（FinMind 優先，yfinance 備援）
 # =========================
@@ -625,7 +669,7 @@ def build_watchlist_summary_message(
 
 def build_market_daily_message(names: Dict[str, str]) -> str:
     """
-    每日股市：用 yfinance 抓大盤（^TWII）簡單摘要
+    每日股市：FinMind 優先抓加權指數（TAIEX），失敗才用 yfinance 的 ^TWII（備援）
     """
     mmdd = datetime.now().strftime("%m/%d")
     lines: List[str] = []
@@ -633,11 +677,23 @@ def build_market_daily_message(names: Dict[str, str]) -> str:
     lines.append("（僅供觀察，非投資建議）")
     lines.append("")
 
-    idx = "^TWII"
-    df = fetch_history_cached(idx)
+    # 1) FinMind 優先
+    df = pd.DataFrame()
+    try:
+        df = _fetch_finmind_taiex()
+    except Exception:
+        df = pd.DataFrame()
+
     close = get_series(df, "Close")
-    if close is None or close.empty or len(close) < 6:
-        lines.append("大盤：資料不足（^TWII 抓不到時偶爾會發生）")
+
+    # 2) FinMind 失敗 -> yfinance 備援
+    if close is None or close.empty or len(close) < 2:
+        idx = "^TWII"
+        df2 = fetch_history_cached(idx)
+        close = get_series(df2, "Close")
+
+    if close is None or close.empty or len(close) < 2:
+        lines.append("大盤：資料不足（FinMind / ^TWII 都抓不到時會發生）")
         return "\n".join(lines)
 
     last = float(close.iloc[-1])
@@ -645,11 +701,15 @@ def build_market_daily_message(names: Dict[str, str]) -> str:
     chg = last - prev
     chg_pct = (chg / prev * 100.0) if prev != 0 else 0.0
 
-    ret5 = (float(close.iloc[-1]) / float(close.iloc[-6]) - 1.0) * 100.0
+    if len(close) >= 6:
+        ret5 = (float(close.iloc[-1]) / float(close.iloc[-6]) - 1.0) * 100.0
+        ret5_line = f"近5日：{ret5:+.2f}%"
+    else:
+        ret5_line = "近5日：資料不足"
 
     lines.append(f"加權指數：{last:,.2f}")
     lines.append(f"日變動：{chg:+.2f}（{chg_pct:+.2f}%）")
-    lines.append(f"近5日：{ret5:+.2f}%")
+    lines.append(ret5_line)
     lines.append("")
     lines.append("指令：輸入『十大』看你關注清單 score 前十；輸入代號查單檔。")
     return "\n".join(lines)
