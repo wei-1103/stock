@@ -28,6 +28,7 @@ TOP_N_SCORE = int(os.environ.get("TOP_N_SCORE", "10"))
 
 CACHE_TTL_SEC = int(os.environ.get("CACHE_TTL_SEC", "300"))  # 5 min default
 
+
 # =========================
 # 路徑設定（可寫才用；不可寫就 fallback）
 # =========================
@@ -40,6 +41,7 @@ def _ensure_writable_dir(p: Path) -> Path:
     test.write_text("ok", encoding="utf-8")
     test.unlink(missing_ok=True)
     return p
+
 
 def _resolve_data_dir() -> Path:
     # 依序嘗試：env DATA_DIR -> /var/data -> /tmp/data
@@ -64,6 +66,7 @@ def _resolve_data_dir() -> Path:
         # 真的都不行就回 /tmp
         return Path("/tmp")
 
+
 DATA_DIR = _resolve_data_dir()
 
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", str(DATA_DIR / "_cache")))
@@ -79,6 +82,8 @@ try:
     NAMES_FILE.parent.mkdir(parents=True, exist_ok=True)
 except Exception:
     pass
+
+
 ETF_NAME_OVERRIDES = {
     "0050.TW": "元大台灣50",
     "006208.TW": "富邦台50",
@@ -147,7 +152,7 @@ def resolve_query_to_ticker(query: str, names: Dict[str, str]) -> Optional[str]:
 
 
 # =========================
-# 快取（yfinance）
+# 快取
 # =========================
 def _cache_path(ticker: str) -> Path:
     h = hashlib.md5(ticker.encode("utf-8")).hexdigest()
@@ -161,12 +166,88 @@ def _is_cache_valid(path: Path) -> bool:
     return age <= CACHE_TTL_SEC
 
 
+# =========================
+# FinMind 抓台股（優先）
+# =========================
+FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "").strip()
+FINMIND_API = "https://api.finmindtrade.com/api/v4/data"
+
+
+def _ticker_to_finmind_id(ticker: str) -> str:
+    # 2330.TW / 2330.TWO -> 2330
+    return pretty_code(ticker)
+
+
+def _fetch_finmind_stock_price(ticker: str) -> pd.DataFrame:
+    """
+    回傳欄位：Open/High/Low/Close/Volume，index=DatetimeIndex
+    讓你後面 get_series(df,"Close") 不用改
+    """
+    if not FINMIND_TOKEN:
+        return pd.DataFrame()
+
+    stock_id = _ticker_to_finmind_id(ticker)
+    start_date = (datetime.now() - pd.Timedelta(days=LOOKBACK_DAYS + 400)).strftime("%Y-%m-%d")
+
+    headers = {"Authorization": f"Bearer {FINMIND_TOKEN}"}
+    params = {
+        "dataset": "TaiwanStockPrice",
+        "data_id": stock_id,
+        "start_date": start_date,
+    }
+
+    r = requests.get(FINMIND_API, headers=headers, params=params, timeout=30)
+    r.raise_for_status()
+    js = r.json()
+
+    data = js.get("data") or []
+    if not data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data)
+    # FinMind 常見欄位：date, open, max, min, close, Trading_Volume...
+    # 這邊轉成你原本會用的格式
+    col_map = {
+        "open": "Open",
+        "max": "High",
+        "min": "Low",
+        "close": "Close",
+        "Trading_Volume": "Volume",
+        "Trading_money": "Trading_money",
+        "Trading_turnover": "Trading_turnover",
+    }
+
+    # 日期
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+
+    # 重命名（存在才改）
+    rename = {k: v for k, v in col_map.items() if k in df.columns}
+    df = df.rename(columns=rename)
+
+    # 只留下核心欄位（存在才留）
+    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+    df = df[keep].copy()
+
+    # 轉數字
+    for c in keep:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna(subset=["Close"]) if "Close" in df.columns else df
+    return df
+
+
+# =========================
+# 抓價格（FinMind 優先，yfinance 備援）
+# =========================
 def fetch_history_cached(ticker: str) -> pd.DataFrame:
     """
     先讀快取（有效就直接回）
-    快取失效才去 yfinance 抓，並存回快取
-    內建：rate limit 退避重試
-    加強：download 失敗時 fallback 用 Ticker().history()
+    快取失效才去抓：
+      1) 台股：先用 FinMind（較穩）
+      2) 失敗再用 yfinance（備援）
+    並存回快取
     """
     p = _cache_path(ticker)
 
@@ -177,44 +258,53 @@ def fetch_history_cached(ticker: str) -> pd.DataFrame:
         except Exception:
             pass
 
-    last_err = None
-    for attempt in range(6):
+    # 2) 先 FinMind（主要解 2330 抓不到）
+    df = pd.DataFrame()
+    try:
+        # 台股/ETF 才走 FinMind（2330.TW、0050.TW...）
+        if ticker.upper().endswith(".TW") or ticker.upper().endswith(".TWO"):
+            df = _fetch_finmind_stock_price(ticker)
+    except Exception:
+        df = pd.DataFrame()
+
+    # 3) FinMind 失敗 → yfinance 備援（含退避重試）
+    if df is None or df.empty:
+        last_err = None
+        for attempt in range(6):
+            try:
+                df = yf.download(
+                    ticker,
+                    period="1y",
+                    interval="1d",
+                    progress=False,
+                    auto_adjust=False,
+                    threads=False,
+                    group_by="column",
+                )
+                if df is None or df.empty:
+                    df = yf.Ticker(ticker).history(period="1y", interval="1d", auto_adjust=False)
+
+                break
+            except Exception as e:
+                last_err = e
+                msg = str(e).lower()
+                if ("rate" in msg) or ("too many" in msg) or ("429" in msg):
+                    wait = (2 ** attempt) + random.uniform(0.3, 1.2)
+                    time.sleep(wait)
+                    continue
+                break
+
+        if df is None:
+            df = pd.DataFrame()
+
+    # 4) 存快取
+    if df is not None and not df.empty:
         try:
-            # A) 先用 download
-            df = yf.download(
-                ticker,
-                period="1y",
-                interval="1d",
-                progress=False,
-                auto_adjust=False,
-                threads=False,
-                group_by="column",
-            )
+            df.to_pickle(p)
+        except Exception:
+            pass
 
-            # B) download 偶發會回空，改用 history 再試一次
-            if df is None or df.empty:
-                df = yf.Ticker(ticker).history(period="1y", interval="1d", auto_adjust=False)
-
-            # C) 存快取
-            if df is not None and not df.empty:
-                try:
-                    df.to_pickle(p)
-                except Exception:
-                    pass
-
-            return df if df is not None else pd.DataFrame()
-
-        except Exception as e:
-            last_err = e
-            msg = str(e).lower()
-            if ("rate" in msg) or ("too many" in msg) or ("429" in msg):
-                wait = (2 ** attempt) + random.uniform(0.3, 1.2)
-                time.sleep(wait)
-                continue
-            raise
-
-    print(f"⚠️ fetch_history_cached 失敗：{ticker}｜{last_err}")
-    return pd.DataFrame()
+    return df if df is not None else pd.DataFrame()
 
 
 def get_series(df: pd.DataFrame, col_name: str) -> pd.Series:
@@ -543,7 +633,6 @@ def build_market_daily_message(names: Dict[str, str]) -> str:
     lines.append("（僅供觀察，非投資建議）")
     lines.append("")
 
-    # 台灣加權指數（通常 yfinance 可用 ^TWII）
     idx = "^TWII"
     df = fetch_history_cached(idx)
     close = get_series(df, "Close")
