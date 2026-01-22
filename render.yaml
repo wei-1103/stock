@@ -7,8 +7,6 @@ services:
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
     healthCheckPath: /
     envVars:
-      - key: PYTHON_VERSION
-        value: "3.11.11"
       - key: DATA_DIR
         value: /var/data
       - key: DB_PATH
@@ -30,7 +28,6 @@ services:
       mountPath: /var/data
       sizeGB: 1
 
-  # 每天固定推播：台灣時間 09:00 = UTC 01:00
   - type: cron
     name: stock-bot-daily
     env: python
@@ -52,7 +49,7 @@ services:
         value: "120"
       - key: LINE_CHANNEL_ACCESS_TOKEN
         sync: false
-        disk:
-        name: stockbot-data
-        mountPath: /var/data
-        sizeGB: 1
+    disk:
+      name: stockbot-data
+      mountPath: /var/data
+      sizeGB: 1
