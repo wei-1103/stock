@@ -166,6 +166,7 @@ def fetch_history_cached(ticker: str) -> pd.DataFrame:
     先讀快取（有效就直接回）
     快取失效才去 yfinance 抓，並存回快取
     內建：rate limit 退避重試
+    加強：download 失敗時 fallback 用 Ticker().history()
     """
     p = _cache_path(ticker)
 
@@ -176,10 +177,10 @@ def fetch_history_cached(ticker: str) -> pd.DataFrame:
         except Exception:
             pass
 
-    # 2) 快取無效 → yfinance（含退避重試）
     last_err = None
     for attempt in range(6):
         try:
+            # A) 先用 download
             df = yf.download(
                 ticker,
                 period="1y",
@@ -189,11 +190,18 @@ def fetch_history_cached(ticker: str) -> pd.DataFrame:
                 threads=False,
                 group_by="column",
             )
+
+            # B) download 偶發會回空，改用 history 再試一次
+            if df is None or df.empty:
+                df = yf.Ticker(ticker).history(period="1y", interval="1d", auto_adjust=False)
+
+            # C) 存快取
             if df is not None and not df.empty:
                 try:
                     df.to_pickle(p)
                 except Exception:
                     pass
+
             return df if df is not None else pd.DataFrame()
 
         except Exception as e:
