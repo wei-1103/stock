@@ -7,6 +7,8 @@ services:
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
     healthCheckPath: /
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.11"
       - key: DATA_DIR
         value: /var/data
       - key: DB_PATH
@@ -36,8 +38,6 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: python stock.py
     envVars:
-      - key: PYTHON_VERSION
-        value: "3.11.8"
       - key: DATA_DIR
         value: /var/data
       - key: DB_PATH
