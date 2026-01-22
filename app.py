@@ -1,113 +1,41 @@
-import os
-import json
-import time
-import random
-import hashlib
-from pathlib import Path
-from datetime import datetime
+# app.py
+from __future__ import annotations
 
-import requests
-import yfinance as yf
-import pandas as pd
+import os
+import re
+from typing import Optional, Tuple, List, Dict
+
 from flask import Flask, request
 
-# =========================
-# Flask App（只宣告一次）
-# =========================
+import requests
+
+from db import (
+    init_db,
+    add_watchlist, remove_watchlist, list_watchlist,
+    add_favorite, remove_favorite, list_favorites,
+    add_alert, disable_alerts_for_ticker, list_alerts,
+)
+from core import (
+    load_names,
+    resolve_query_to_ticker,
+    build_single_stock_reply,
+    build_watchlist_summary_message,
+    build_market_daily_message,
+)
+
 app = Flask(__name__)
+init_db()
 
-# =========================
-# LINE 設定
-# =========================
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")  # 你之後要驗簽再用
+
 
 # =========================
-# 檔案位置
+# LINE reply/push
 # =========================
-BASE_DIR = Path(__file__).resolve().parent
-NAMES_FILE = BASE_DIR / "names.json"
-
-ETF_NAME_OVERRIDES = {
-    "0050.TW": "元大台灣50",
-    "006208.TW": "富邦台50",
-    "00878.TW": "國泰永續高股息",
-    "00919.TW": "群益台灣精選高息",
-    "0056.TW": "元大高股息",
-    "00757.TW": "統一FANG+",
-}
-
-# ====== 你的參數（沿用）======
-CHEAP_CUTOFF = 0.25
-EXPENSIVE_CUTOFF = 0.70
-LOOKBACK_DAYS = 120
-
-# =========================
-# 快取設定
-# =========================
-CACHE_DIR = BASE_DIR / "_cache"
-CACHE_DIR.mkdir(exist_ok=True)
-CACHE_TTL_SEC = 300  # 5 分鐘
-
-def _cache_path(ticker: str) -> Path:
-    h = hashlib.md5(ticker.encode("utf-8")).hexdigest()
-    return CACHE_DIR / f"{h}.pkl"
-
-def _is_cache_valid(path: Path) -> bool:
-    if not path.exists():
-        return False
-    age = time.time() - path.stat().st_mtime
-    return age <= CACHE_TTL_SEC
-
-def fetch_history_cached(ticker: str) -> pd.DataFrame:
-    p = _cache_path(ticker)
-
-    # 1) cache hit
-    if _is_cache_valid(p):
-        try:
-            return pd.read_pickle(p)
-        except Exception:
-            pass
-
-    # 2) cache miss -> yfinance with backoff
-    last_err = None
-    for attempt in range(6):
-        try:
-            df = yf.download(
-                ticker,
-                period="1y",
-                interval="1d",
-                progress=False,
-                auto_adjust=False,
-                threads=False,
-                group_by="column",
-            )
-
-            if df is not None and not df.empty:
-                try:
-                    df.to_pickle(p)
-                except Exception:
-                    pass
-
-            return df if df is not None else pd.DataFrame()
-
-        except Exception as e:
-            last_err = e
-            msg = str(e).lower()
-            if ("rate" in msg) or ("too many" in msg) or ("429" in msg):
-                wait = (2 ** attempt) + random.uniform(0.3, 1.2)
-                time.sleep(wait)
-                continue
-            raise
-
-    print(f"⚠️ fetch_history_cached 失敗：{ticker}｜{last_err}")
-    return pd.DataFrame()
-
-# =========================
-# LINE reply
-# =========================
-def reply_line(reply_token: str, msg: str):
+def reply_line(reply_token: str, msg: str) -> Tuple[int, str]:
     if not CHANNEL_ACCESS_TOKEN:
-        print("⚠️ LINE_CHANNEL_ACCESS_TOKEN 未設定，無法回覆。")
+        print("⚠️ LINE_CHANNEL_ACCESS_TOKEN 未設定")
         print(msg)
         return 200, "NO_TOKEN"
 
@@ -116,241 +44,278 @@ def reply_line(reply_token: str, msg: str):
         "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
         "Content-Type": "application/json"
     }
-    payload = {
-        "replyToken": reply_token,
-        "messages": [{"type": "text", "text": msg}]
-    }
+    payload = {"replyToken": reply_token, "messages": [{"type": "text", "text": msg}]}
     r = requests.post(url, headers=headers, json=payload, timeout=20)
-    print("reply status =", r.status_code)
-    print("reply body =", r.text)
     return r.status_code, r.text
 
-# =========================
-# names.json
-# =========================
-def load_names_for_reply() -> dict:
-    names = {}
-    if NAMES_FILE.exists():
-        try:
-            with open(NAMES_FILE, "r", encoding="utf-8") as f:
-                names = json.load(f) or {}
-        except Exception:
-            names = {}
-    for k, v in ETF_NAME_OVERRIDES.items():
-        names[k] = v
-    return names
-
-def pretty_code(ticker: str) -> str:
-    return ticker.replace(".TW", "").replace(".TWO", "")
-
-def display_name(ticker: str, names: dict) -> str:
-    nm = (names or {}).get(ticker, "")
-    code = pretty_code(ticker)
-    return f"{nm} {code}".strip() if nm else code
-
-def normalize_ticker_input(s: str) -> str:
-    s = (s or "").strip()
-    if not s:
-        return ""
-    for prefix in ["查", "看", "問", "幫我看", "幫我查"]:
-        if s.startswith(prefix):
-            s = s[len(prefix):].strip()
-
-    if s.isdigit() and len(s) == 4:
-        return f"{s}.TW"
-    if ".TW" in s.upper():
-        return s.upper()
-    return s
-
-def resolve_query_to_ticker(query: str, names: dict):
-    q = normalize_ticker_input(query)
-    if q.upper().endswith(".TW"):
-        return q.upper()
-
-    q2 = q.strip()
-    if not q2:
-        return None
-
-    for t, nm in (names or {}).items():
-        if nm == q2:
-            return t
-
-    digits = "".join([c for c in q2 if c.isdigit()])
-    if len(digits) == 4:
-        return f"{digits}.TW"
-
-    return None
-
-def get_series(df: pd.DataFrame, col_name: str) -> pd.Series:
-    if df is None or df.empty:
-        return pd.Series(dtype=float)
-
-    if col_name in df.columns:
-        s = df[col_name]
-        if isinstance(s, pd.DataFrame):
-            s = s.iloc[:, 0]
-        return s.dropna()
-
-    if isinstance(df.columns, pd.MultiIndex):
-        try:
-            s = df.xs(col_name, axis=1, level=-1)
-            if isinstance(s, pd.DataFrame):
-                s = s.iloc[:, 0]
-            return s.dropna()
-        except Exception:
-            return pd.Series(dtype=float)
-
-    return pd.Series(dtype=float)
 
 # =========================
-# 你的計算（沿用）
+# 指令解析
 # =========================
-def price_level_label(pos: float) -> str:
-    if pos <= CHEAP_CUTOFF:
-        return "偏便宜"
-    elif pos >= EXPENSIVE_CUTOFF:
-        return "偏貴"
-    else:
-        return "普通"
+HELP_TEXT = (
+    "指令大全：\n"
+    "1) 查單檔：直接輸入 2330 或 台積電\n"
+    "2) 關注：新增 2330｜刪除 2330｜清單\n"
+    "3) 最愛：最愛新增 2330｜最愛刪除 2330｜最愛清單\n"
+    "4) 十大：十大（watchlist score 前十）\n"
+    "5) 每日：每日（大盤摘要）\n"
+    "6) 提醒：提醒 2330 600（預設跌破）\n"
+    "   或：提醒 2330 > 600 / 提醒 2330 < 600\n"
+    "   取消：取消提醒 2330\n"
+    "（僅供觀察，非投資建議）"
+)
 
-def calc_pos(close: pd.Series):
-    if close is None or close.empty or len(close) < 30:
-        return None
+RE_ADD = re.compile(r"^\s*新增\s+(.+)\s*$")
+RE_DEL = re.compile(r"^\s*刪除\s+(.+)\s*$")
+RE_LIST = re.compile(r"^\s*清單\s*$")
 
-    price = float(close.iloc[-1])
-    low_52 = float(close.min())
-    high_52 = float(close.max())
+RE_FAV_ADD = re.compile(r"^\s*最愛新增\s+(.+)\s*$")
+RE_FAV_DEL = re.compile(r"^\s*最愛刪除\s+(.+)\s*$")
+RE_FAV_LIST = re.compile(r"^\s*最愛清單\s*$")
 
-    denom = (high_52 - low_52)
-    pos = 0.5 if denom <= 1e-12 else (price - low_52) / denom
-    pos = max(0.0, min(1.0, float(pos)))
-    tag = price_level_label(pos)
-    return {"price": price, "pos": pos, "tag": tag}
+RE_TOP10 = re.compile(r"^\s*十大\s*$")
+RE_DAILY = re.compile(r"^\s*每日\s*$")
 
-def heat_label(ret5: float, vol_ratio):
-    if ret5 >= 15:
-        return "近期漲幅明顯"
-    if ret5 >= 5:
-        return "溫和上漲"
-    if ret5 <= -10:
-        return "近期偏弱"
-    return "變動不大"
+RE_ALERT = re.compile(r"^\s*提醒\s+(.+?)\s+(.+)\s*$")
+RE_ALERT_CANCEL = re.compile(r"^\s*取消提醒\s+(.+)\s*$")
 
-def calc_watch_score(close: pd.Series, volume):
-    if close is None or close.empty or len(close) < 25:
-        return None
-    if len(close) < 6:
-        return None
+RE_HELP = re.compile(r"^\s*(help|幫助|指令)\s*$", re.IGNORECASE)
 
-    ret5 = (float(close.iloc[-1]) / float(close.iloc[-6]) - 1.0) * 100.0
 
-    vol_ratio = None
-    if volume is not None and not volume.empty and len(volume) >= 20:
-        v_today = float(volume.iloc[-1]) if pd.notna(volume.iloc[-1]) else 0.0
-        v_avg20 = float(volume.tail(20).mean()) if pd.notna(volume.tail(20).mean()) else 0.0
-        if v_avg20 > 1e-9:
-            vol_ratio = v_today / v_avg20
+def parse_alert_price(s: str) -> Tuple[str, float]:
+    """
+    支援：
+    - "600" -> below 600
+    - "< 600" / "＜600" -> below
+    - "> 600" / "＞600" -> above
+    """
+    raw = s.strip().replace("＜", "<").replace("＞", ">").replace(" ", "")
+    direction = "below"
+    if raw.startswith(">"):
+        direction = "above"
+        raw = raw[1:]
+    elif raw.startswith("<"):
+        direction = "below"
+        raw = raw[1:]
 
-    score = ret5
-    if vol_ratio is not None:
-        score += min(max(vol_ratio - 1.0, 0.0), 2.0)
+    price = float(raw)
+    return direction, price
 
-    return {"ret5": ret5, "vol_ratio": vol_ratio, "score": score, "heat": heat_label(ret5, vol_ratio)}
 
-def tag_desc(tag: str) -> str:
-    if tag == "偏便宜":
-        return "較靠近一年低點"
-    if tag == "偏貴":
-        return "較靠近一年高點"
-    return "大約在中間區"
+def ensure_ticker(q: str, names: Dict[str, str]) -> Optional[str]:
+    t = resolve_query_to_ticker(q, names)
+    # 沒找到就試著把純 4 碼補 .TW
+    if not t:
+        q2 = (q or "").strip()
+        if q2.isdigit() and len(q2) == 4:
+            t = f"{q2}.TW"
+    return t
 
-def volume_word(vol_ratio):
-    if vol_ratio is None:
-        return "交易狀況：未知"
-    if vol_ratio >= 1.5:
-        return "交易狀況：變熱"
-    if vol_ratio >= 0.8:
-        return "交易狀況：正常"
-    return "交易狀況：偏少"
 
-def build_single_stock_reply(ticker: str, names: dict) -> str:
-    # ✅ 這裡改成用快取版本
-    df = fetch_history_cached(ticker)
-    if df is None or df.empty:
-        return "抓不到這檔的資料（可能被限流或暫時抓不到），請稍後再試。"
-
-    close = get_series(df, "Close")
-    if close.empty:
-        return "這檔資料不足（收盤價抓不到）。"
-
-    info = calc_pos(close)
-    if info is None:
-        return "這檔資料太少，暫時無法計算。"
-
-    vol = get_series(df, "Volume")
-    score = calc_watch_score(close.tail(LOOKBACK_DAYS), vol.tail(LOOKBACK_DAYS) if not vol.empty else None)
-
-    title = display_name(ticker, names)
-    mmdd = datetime.now().strftime("%m/%d")
-
-    lines = []
-    lines.append(f"{title}｜{mmdd}")
-    lines.append("")
-    lines.append("【價格狀態】")
-    lines.append(f"價格：{info['price']:.2f}")
-    lines.append(f"狀態：{info['tag']}（{tag_desc(info['tag'])}）")
-    lines.append("")
-    lines.append("【近期觀察】")
-    if score:
-        lines.append(f"近期表現：{score['heat']}（近5日 {score['ret5']:+.1f}%）")
-        lines.append(volume_word(score["vol_ratio"]))
-    else:
-        lines.append("近期表現：資料不足")
-    lines.append("")
-    lines.append("（僅供觀察，非投資建議）")
-    return "\n".join(lines)
-
-def handle_user_text(reply_token: str, user_text: str):
-    names = load_names_for_reply()
-    ticker = resolve_query_to_ticker(user_text, names)
-
-    if not ticker:
-        help_msg = "你可以直接輸入股票代號或名稱：\n例如：2330 / 2330.TW / 台積電"
-        reply_line(reply_token, help_msg)
+def handle_text(user_id: str, text: str, reply_token: str) -> None:
+    text = (text or "").strip()
+    if not text:
+        reply_line(reply_token, HELP_TEXT)
         return
 
-    msg = build_single_stock_reply(ticker, names)
+    # names（用來中文名反查）
+    names = load_names()
+
+    # 幫助
+    if RE_HELP.match(text):
+        reply_line(reply_token, HELP_TEXT)
+        return
+
+    # 清單
+    if RE_LIST.match(text):
+        wl = list_watchlist(user_id)
+        if not wl:
+            reply_line(reply_token, "你的關注清單是空的。\n用法：新增 2330\n" + "（僅供觀察，非投資建議）")
+            return
+        msg = "你的關注清單：\n" + "\n".join([f"- {t}" for t in wl])
+        msg += "\n\n（僅供觀察，非投資建議）"
+        reply_line(reply_token, msg)
+        return
+
+    # 新增 / 刪除 watchlist
+    m = RE_ADD.match(text)
+    if m:
+        q = m.group(1)
+        t = ensure_ticker(q, names)
+        if not t:
+            reply_line(reply_token, "我看不懂你要新增哪一檔🥲\n例：新增 2330")
+            return
+        ok = add_watchlist(user_id, t)
+        reply_line(reply_token, f"{'✅ 已新增' if ok else '（已在清單中）'}：{t}")
+        return
+
+    m = RE_DEL.match(text)
+    if m:
+        q = m.group(1)
+        t = ensure_ticker(q, names)
+        if not t:
+            reply_line(reply_token, "我看不懂你要刪除哪一檔🥲\n例：刪除 2330")
+            return
+        ok = remove_watchlist(user_id, t)
+        reply_line(reply_token, f"{'✅ 已刪除' if ok else '（清單中沒有這檔）'}：{t}")
+        return
+
+    # 最愛清單
+    if RE_FAV_LIST.match(text):
+        fav = list_favorites(user_id)
+        if not fav:
+            reply_line(reply_token, "你的最愛清單是空的。\n用法：最愛新增 2330\n" + "（僅供觀察，非投資建議）")
+            return
+        msg = "你的最愛清單：\n" + "\n".join([f"- {t}" for t in fav])
+        msg += "\n\n（最愛會每天固定推播摘要；僅供觀察，非投資建議）"
+        reply_line(reply_token, msg)
+        return
+
+    # 最愛新增/刪除
+    m = RE_FAV_ADD.match(text)
+    if m:
+        q = m.group(1)
+        t = ensure_ticker(q, names)
+        if not t:
+            reply_line(reply_token, "我看不懂你要加入最愛哪一檔🥲\n例：最愛新增 2330")
+            return
+        ok = add_favorite(user_id, t)
+        reply_line(reply_token, f"{'💛 已加入最愛' if ok else '（已在最愛中）'}：{t}")
+        return
+
+    m = RE_FAV_DEL.match(text)
+    if m:
+        q = m.group(1)
+        t = ensure_ticker(q, names)
+        if not t:
+            reply_line(reply_token, "我看不懂你要移除最愛哪一檔🥲\n例：最愛刪除 2330")
+            return
+        ok = remove_favorite(user_id, t)
+        reply_line(reply_token, f"{'🖤 已移除最愛' if ok else '（最愛中沒有這檔）'}：{t}")
+        return
+
+    # 十大（watchlist score 前十）
+    if RE_TOP10.match(text):
+        wl = list_watchlist(user_id)
+        if not wl:
+            reply_line(reply_token, "你的關注清單是空的，無法計算十大。\n先用：新增 2330")
+            return
+        names2 = load_names(wl)
+        msg = build_watchlist_summary_message(wl, names2, title_prefix="十大排名", include_top10=True)
+        reply_line(reply_token, msg)
+        return
+
+    # 每日股市
+    if RE_DAILY.match(text):
+        msg = build_market_daily_message(load_names())
+        reply_line(reply_token, msg)
+        return
+
+    # 提醒設定
+    m = RE_ALERT.match(text)
+    if m:
+        q = m.group(1).strip()
+        p = m.group(2).strip()
+        t = ensure_ticker(q, names)
+        if not t:
+            reply_line(reply_token, "我看不懂你要提醒哪一檔🥲\n例：提醒 2330 600")
+            return
+        try:
+            direction, price = parse_alert_price(p)
+        except Exception:
+            reply_line(reply_token, "提醒價格格式不對🥲\n例：提醒 2330 600 或 提醒 2330 < 600")
+            return
+        alert_id = add_alert(user_id, t, direction, price)
+        sym = "跌破" if direction == "below" else "突破"
+        reply_line(reply_token, f"✅ 已設定提醒：{t} {sym} {price}\n（提醒會在每日排程檢查）")
+        return
+
+    m = RE_ALERT_CANCEL.match(text)
+    if m:
+        q = m.group(1).strip()
+        t = ensure_ticker(q, names)
+        if not t:
+            reply_line(reply_token, "我看不懂你要取消哪一檔的提醒🥲\n例：取消提醒 2330")
+            return
+        n = disable_alerts_for_ticker(user_id, t)
+        reply_line(reply_token, f"✅ 已取消提醒：{t}（共停用 {n} 條）")
+        return
+
+    # 其他：當作查單檔
+    t = resolve_query_to_ticker(text, names)
+    if not t:
+        # 如果是純數字 4 碼
+        if text.isdigit() and len(text) == 4:
+            t = f"{text}.TW"
+
+    if not t:
+        reply_line(reply_token, "我看不懂你的指令🥲\n\n" + HELP_TEXT)
+        return
+
+    msg = build_single_stock_reply(t, names)
     reply_line(reply_token, msg)
 
+
 # =========================
-# Routes
+# Webhook
 # =========================
 @app.route("/", methods=["GET"])
 def home():
     return "OK"
 
-@app.route("/callback", methods=["POST"])
-def line_callback():
+
+@app.route("/callback", methods=["GET", "POST"])
+def callback():
+    if request.method == "GET":
+        return "OK"
+
     data = request.get_json(silent=True)
     if not data or "events" not in data:
         return "OK"
 
     for event in data["events"]:
-        if event.get("type") != "message":
-            continue
-        msg = event.get("message", {})
-        if msg.get("type") != "text":
+        etype = event.get("type")
+
+        # 來源 userId（重要：每個人都會有自己的 watchlist/fav）
+        source = event.get("source", {}) or {}
+        user_id = source.get("userId", "")
+
+        reply_token = event.get("replyToken", "")
+
+        # 加好友 welcome（follow 事件）
+        if etype == "follow":
+            if reply_token:
+                welcome = (
+                    "感謝您的加入 (´-ω- )💨\n\n"
+                    "這是自動回覆機器人：\n"
+                    "- 直接輸入股票代號：2330\n"
+                    "- 或輸入：清單 / 新增 2330 / 刪除 2330 / 十大 / 每日\n"
+                    "- 最愛：最愛新增 2330（每天會推播摘要）\n"
+                    "- 提醒：提醒 2330 600（預設跌破）\n\n"
+                    "（僅供觀察，非投資建議）"
+                )
+                reply_line(reply_token, welcome)
             continue
 
-        user_text = msg.get("text", "")
-        reply_token = event.get("replyToken", "")
-        if reply_token:
-            handle_user_text(reply_token, user_text)
+        # 訊息事件
+        if etype != "message":
+            continue
+
+        msg = event.get("message", {}) or {}
+        if msg.get("type") != "text":
+            if reply_token:
+                reply_line(reply_token, "目前只支援文字訊息喔～\n\n" + HELP_TEXT)
+            continue
+
+        text = msg.get("text", "")
+        if reply_token and user_id:
+            handle_text(user_id, text, reply_token)
+        elif reply_token:
+            reply_line(reply_token, "我抓不到你的 userId，可能是 webhook 格式不完整。")
 
     return "OK"
 
-# =========================
-# local run only
-# =========================
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)

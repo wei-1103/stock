@@ -1,0 +1,52 @@
+services:
+  - type: web
+    name: stock-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    healthCheckPath: /
+    envVars:
+      - key: DATA_DIR
+        value: /var/data
+      - key: DB_PATH
+        value: /var/data/bot.db
+      - key: CACHE_DIR
+        value: /var/data/_cache
+      - key: NAMES_FILE
+        value: /var/data/names.json
+      - key: CACHE_TTL_SEC
+        value: "300"
+      - key: LOOKBACK_DAYS
+        value: "120"
+      - key: LINE_CHANNEL_ACCESS_TOKEN
+        sync: false
+      - key: LINE_CHANNEL_SECRET
+        sync: false
+    disk:
+      name: stockbot-data
+      mountPath: /var/data
+      sizeGB: 1
+
+  # 每天固定推播：台灣時間 09:00 = UTC 01:00
+  - type: cron
+    name: stock-bot-daily
+    env: python
+    schedule: "0 1 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python stock.py
+    envVars:
+      - key: DATA_DIR
+        value: /var/data
+      - key: DB_PATH
+        value: /var/data/bot.db
+      - key: CACHE_DIR
+        value: /var/data/_cache
+      - key: NAMES_FILE
+        value: /var/data/names.json
+      - key: CACHE_TTL_SEC
+        value: "300"
+      - key: LOOKBACK_DAYS
+        value: "120"
+      - key: LINE_CHANNEL_ACCESS_TOKEN
+        sync: false
