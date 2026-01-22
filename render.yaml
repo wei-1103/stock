@@ -7,10 +7,6 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
     healthCheckPath: /
-    disk:
-      name: stockbot-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: DATA_DIR
         value: /tmp/data
@@ -19,7 +15,7 @@ services:
       - key: CACHE_DIR
         value: /tmp/data/_cache
       - key: NAMES_FILE
-        value: /opt/render/project/src/names.json
+        value: /tmp/data/names.json
       - key: CACHE_TTL_SEC
         value: "300"
       - key: LOOKBACK_DAYS
@@ -36,7 +32,6 @@ services:
     schedule: "0 1 * * *"
     buildCommand: pip install -r requirements.txt
     startCommand: python stock.py
-    
     envVars:
       - key: DATA_DIR
         value: /tmp/data
@@ -45,11 +40,12 @@ services:
       - key: CACHE_DIR
         value: /tmp/data/_cache
       - key: NAMES_FILE
-        value: /opt/render/project/src/names.json
+        value: /tmp/data/names.json
       - key: CACHE_TTL_SEC
         value: "300"
       - key: LOOKBACK_DAYS
         value: "120"
       - key: LINE_CHANNEL_ACCESS_TOKEN
         sync: false
-    
+      - key: LINE_CHANNEL_SECRET
+        sync: false

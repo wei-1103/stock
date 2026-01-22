@@ -28,14 +28,57 @@ TOP_N_SCORE = int(os.environ.get("TOP_N_SCORE", "10"))
 
 CACHE_TTL_SEC = int(os.environ.get("CACHE_TTL_SEC", "300"))  # 5 min default
 
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/var/data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+# =========================
+# 路徑設定（可寫才用；不可寫就 fallback）
+# =========================
+def _ensure_writable_dir(p: Path) -> Path:
+    """
+    確保資料夾存在且可寫；不可寫就丟例外
+    """
+    p.mkdir(parents=True, exist_ok=True)
+    test = p / ".write_test"
+    test.write_text("ok", encoding="utf-8")
+    test.unlink(missing_ok=True)
+    return p
+
+def _resolve_data_dir() -> Path:
+    # 依序嘗試：env DATA_DIR -> /var/data -> /tmp/data
+    candidates = [
+        os.environ.get("DATA_DIR", "").strip(),
+        "/var/data",
+        "/tmp/data",
+    ]
+    for c in candidates:
+        if not c:
+            continue
+        try:
+            return _ensure_writable_dir(Path(c))
+        except Exception:
+            pass
+
+    # 最後保底：專案底下 data（不一定可寫，但再試一次）
+    fallback = Path.cwd() / "data"
+    try:
+        return _ensure_writable_dir(fallback)
+    except Exception:
+        # 真的都不行就回 /tmp
+        return Path("/tmp")
+
+DATA_DIR = _resolve_data_dir()
 
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", str(DATA_DIR / "_cache")))
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    _ensure_writable_dir(CACHE_DIR)
+except Exception:
+    # cache 失敗就退回 /tmp/cache
+    CACHE_DIR = _ensure_writable_dir(Path("/tmp/data/_cache"))
 
 NAMES_FILE = Path(os.environ.get("NAMES_FILE", str(DATA_DIR / "names.json")))
-
+# 確保 names.json 的父層存在（避免寫入時炸掉）
+try:
+    NAMES_FILE.parent.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
 ETF_NAME_OVERRIDES = {
     "0050.TW": "元大台灣50",
     "006208.TW": "富邦台50",
