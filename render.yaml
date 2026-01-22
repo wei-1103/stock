@@ -13,13 +13,13 @@ services:
       sizeGB: 1
     envVars:
       - key: DATA_DIR
-        value: /var/data
+        value: /tmp/data
       - key: DB_PATH
-        value: /var/data/bot.db
+        value: /tmp/data/bot.db
       - key: CACHE_DIR
-        value: /var/data/_cache
+        value: /tmp/data/_cache
       - key: NAMES_FILE
-        value: /var/data/names.json
+        value: /opt/render/project/src/names.json
       - key: CACHE_TTL_SEC
         value: "300"
       - key: LOOKBACK_DAYS
@@ -52,7 +52,4 @@ services:
         value: "120"
       - key: LINE_CHANNEL_ACCESS_TOKEN
         sync: false
-    disk:
-      name: stockbot-data
-      mountPath: /var/data
-      sizeGB: 1
+    
