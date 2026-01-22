@@ -36,10 +36,7 @@ services:
     schedule: "0 1 * * *"
     buildCommand: pip install -r requirements.txt
     startCommand: python stock.py
-    disk:
-      name: stockbot-data
-      mountPath: /var/data
-      sizeGB: 1
+    
     envVars:
       - key: DATA_DIR
         value: /var/data
@@ -55,3 +52,7 @@ services:
         value: "120"
       - key: LINE_CHANNEL_ACCESS_TOKEN
         sync: false
+    disk:
+      name: stockbot-data
+      mountPath: /var/data
+      sizeGB: 1
